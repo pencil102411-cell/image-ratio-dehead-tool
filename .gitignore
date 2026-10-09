@@ -1,0 +1,19 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本机设置（记录上次保存位置等）
+app/settings.json
+
+# 打包输出
+dist/
+build/
+*.spec
+
+# 图片：不要把角色设定图、处理结果传上来
+*.png
+!app/splash.png
+*.jpg
+*.jpeg
+*.webp
+输出/
