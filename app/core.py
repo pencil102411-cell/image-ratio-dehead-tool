@@ -4,7 +4,7 @@ import sys
 import numpy as np
 from PIL import Image
 from scipy.ndimage import (binary_dilation, binary_erosion, binary_fill_holes, gaussian_filter,
-                           label, find_objects)
+                           label, find_objects, maximum_filter1d)
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import cg
 
@@ -82,6 +82,122 @@ def pad_to_ratio(arr, ratio, mode="black"):
             out[top + H:] = np.clip(np.round(bc), 0, 255).astype(np.uint8)[None, :, :]
     out[top:top + H, left:left + W] = arr
     return out, (left, top)
+
+
+# ---------------------------------------------------------------- 分格 / 删除某一格
+
+def side_bars(img, thr=25):
+    """Columns [L, R) between existing near-black bars on the left / right edges."""
+    p = np.percentile(img[:: max(1, img.shape[0] // 400)].max(axis=2), 99, axis=0)
+    dark = p < thr
+    L, R = 0, len(dark)
+    while L < R and dark[L]:
+        L += 1
+    while R > L and dark[R - 1]:
+        R -= 1
+    if R - L < 0.2 * len(dark):        # almost everything dark: don't treat it as bars
+        return 0, len(dark)
+    return L, R
+
+
+def _seam_strength(img, L, R):
+    """s[i]: how much the boundary between content columns i and i+1 looks like a straight full-height seam."""
+    step = max(1, img.shape[0] // 800)
+    g = img[::step, L:R].astype(np.int16)
+    j = np.abs(np.diff(g, axis=1)).sum(2)
+    jp = np.pad(j, ((0, 0), (3, 3)), mode="edge")
+    nb = np.maximum(jp[:, :-6], jp[:, 6:])
+    s = ((j - nb) > 4).mean(axis=0)
+    return maximum_filter1d(s, 3)
+
+
+def _strip_around(img, s, x, L, R):
+    """A gap strip between panels has a seam on BOTH sides and plain columns in between.
+    x is a seam (boundary before column x); look for a partner seam close by."""
+    max_w = max(4, int(0.04 * (R - L)))
+    step = max(1, img.shape[0] // 800)
+    sub = img[::step].astype(np.float32)
+    plain = lambda c: sub[:, c].std(axis=0).max() < 6
+    i = x - L - 1                                   # index of this seam in s
+    thr = max(0.25, 0.5 * s[i])
+    for lo, hi, sign in ((x + 2, min(R, x + max_w), 1), (max(L + 1, x - max_w), x - 2, -1)):
+        cand = [c for c in range(lo, hi) if s[c - L - 1] >= thr]
+        cand.sort(key=lambda c: abs(c - x))
+        for c in cand:
+            a, b = (x, c) if sign > 0 else (c, x)
+            if all(plain(k) for k in range(a, b)):
+                return a, b
+    return x, x
+
+
+def detect_panels(img, n=None):
+    """Split a sheet into side-by-side panels.
+
+    Returns {"L", "R", "dividers": [[a, b], ...], "confident": bool}. A divider [a, b) is the
+    column range between two panels (a == b for a plain seam). With n given, exactly n panels.
+    """
+    H, W = img.shape[:2]
+    L, R = side_bars(img)
+    w = R - L
+    s = _seam_strength(img, L, R)
+
+    def peak(lo, hi):
+        lo, hi = max(1, lo), min(len(s) - 1, hi)
+        i = lo + int(np.argmax(s[lo:hi]))
+        other = np.concatenate([s[lo:max(lo, i - 4)], s[min(hi, i + 5):hi]])
+        return i, float(s[i]), (float(other.max()) if len(other) else 0.0)
+
+    def candidates(k_panels):
+        """For each expected boundary: (x, strength, accepted?)."""
+        out = []
+        for k in range(1, k_panels):
+            c = int(w * k / k_panels)
+            # 1) sheets are normally split evenly: a clear seam right where expected wins
+            i, sc, _ = peak(c - int(0.015 * w), c + int(0.015 * w))
+            ok = sc >= 0.3
+            if not ok:
+                # 2) a bit further away it must clearly beat everything else around it
+                i, sc, second = peak(c - int(0.05 * w), c + int(0.05 * w))
+                ok = sc >= 0.3 and sc >= 1.25 * second
+            out.append((L + i + 1, sc, ok))
+        return out
+
+    best_n, best_score, best_c = None, -1.0, None
+    for k in ((n,) if n else (2, 3, 4, 5)):
+        c = candidates(k)
+        score = min(sc for _, sc, _ in c)
+        if n or (all(ok for _, _, ok in c) and score > best_score + 0.05):
+            best_n, best_score, best_c = k, score, c
+    confident = best_c is not None and not n
+    if best_c is None:                           # nothing convincing: fall back to 3 equal panels
+        best_n, best_c = 3, candidates(3)
+    dividers = [list(_strip_around(img, s, x, L, R)) for x, _, _ in best_c]
+    return {"L": int(L), "R": int(R), "dividers": dividers, "confident": confident, "n": best_n}
+
+
+def panel_ranges(layout):
+    edges = [layout["L"]]
+    for a, b in layout["dividers"]:
+        edges += [a, b]
+    edges.append(layout["R"])
+    return [(edges[i], edges[i + 1]) for i in range(0, len(edges), 2)]
+
+
+def remove_panels(img, layout, delete):
+    """Drop the chosen panels (and one neighbouring gap strip each) and join the rest, pixel for pixel."""
+    panels = panel_ranges(layout)
+    divs = layout["dividers"]
+    keep_parts = []
+    kept = [i for i in range(len(panels)) if i not in delete]
+    for n_i, i in enumerate(kept):
+        if n_i > 0:
+            # keep the gap strip that used to sit just left of this panel, if there was one
+            a, b = divs[i - 1] if i - 1 < len(divs) else (0, 0)
+            if b > a:
+                keep_parts.append(img[:, a:b])
+        p0, p1 = panels[i]
+        keep_parts.append(img[:, p0:p1])
+    return np.ascontiguousarray(np.concatenate(keep_parts, axis=1))
 
 
 # ---------------------------------------------------------------- 识别头部

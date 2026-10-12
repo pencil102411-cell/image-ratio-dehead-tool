@@ -80,8 +80,10 @@ class Doc:
         self.orig = None          # original pixels
         self.info = None
         self.boxes = []           # [x0, y0, x1, cut_y] in original coordinates
-        self.stage = "new"        # new → loaded → boxing → done
-        self.mode = None          # "pad" | "dehead"
+        self.layout = None        # panel split: {"L", "R", "dividers": [[a, b], ...]}
+        self.delete = set()       # indices of panels to drop
+        self.stage = "new"        # new → loaded → boxing / panels → done
+        self.mode = None          # "pad" | "dehead" | "panel"
         self.result = None        # content after head removal / repairs (not padded)
         self.history = []
         self.brush = None         # PIL "L" mask in OUTPUT (padded) coordinates
@@ -216,6 +218,26 @@ class App:
         self.btn_run = big_button(self.f_box, "✓ 开始去头", self.run_dehead, C_OK)
         self.btn_run.pack(fill="x", pady=(4, 0))
 
+        self.btn_panel_mode = big_button(f_mode, "删掉某一格 → 转 21:9", self.enter_panels, C_ACCENT)
+        self.btn_panel_mode.pack(fill="x", pady=(6, 0))
+
+        # panel sub-panel (shown only while choosing which panel to drop)
+        self.f_panel = ttk.Frame(f_mode)
+        ttk.Label(self.f_panel, text="点一下要删掉的那一格（变红 = 删除，再点取消）。\n分界线不准的话，拖动青色竖线微调。",
+                  style="Hint.TLabel", justify="left").pack(anchor="w", pady=(8, 4))
+        row = ttk.Frame(self.f_panel)
+        row.pack(fill="x")
+        ttk.Label(row, text="一共分几格").pack(side="left")
+        self.panel_n = tk.StringVar(value="自动识别")
+        self.cmb_panels = ttk.Combobox(row, textvariable=self.panel_n, values=["自动识别", "2", "3", "4", "5"],
+                                       width=8, state="readonly")
+        self.cmb_panels.pack(side="left", padx=6)
+        self.cmb_panels.bind("<<ComboboxSelected>>", lambda e: self.redetect_panels())
+        self.lbl_panelcount = ttk.Label(self.f_panel, text="", foreground=C_WARN, font=(FONT, 10, "bold"))
+        self.lbl_panelcount.pack(anchor="w", pady=(4, 0))
+        self.btn_panel_run = big_button(self.f_panel, "✓ 删除选中的格", self.run_panels, C_OK)
+        self.btn_panel_run.pack(fill="x", pady=(4, 0))
+
         # repair
         f_fix = ttk.LabelFrame(panel, text=" 修补残留（可选） ", padding=6)
         f_fix.pack(fill="x", pady=(10, 0))
@@ -338,7 +360,7 @@ class App:
         d = self.doc
         if d is None or d.stage == "new":
             cur = 0
-        elif d.stage in ("loaded", "boxing"):
+        elif d.stage in ("loaded", "boxing", "panels"):
             cur = 1
         elif d.saved_path is None:
             cur = 2
@@ -368,11 +390,15 @@ class App:
         self.btn_pad.config(text=("✓ " if d and d.mode == "pad" and stage == "done" else "") + f"只转 {tag}")
         self.btn_dehead_mode.config(text=("✓ " if d and d.mode == "dehead" and stage in ("boxing", "done") else "")
                                     + f"框选头部 → 去头 + 转 {tag}")
+        self.btn_panel_mode.config(text=("✓ " if d and d.mode == "panel" and stage in ("panels", "done") else "")
+                                   + f"删掉某一格 → 转 {tag}")
+        self.btn_panel_run.config(text=f"✓ 删除选中的格 + 转 {tag}")
         en(self.btn_pad, ready)
         en(self.btn_dehead_mode, ready)
+        en(self.btn_panel_mode, ready)
         if stage == "boxing" and d is not None:
             if not self.f_box.winfo_ismapped():
-                self.f_box.pack(fill="x")
+                self.f_box.pack(fill="x", after=self.btn_dehead_mode)
             n = len(d.boxes)
             self.lbl_boxcount.config(text=f"已框选 {n} 个头部" if n else "还没有框（请在图上拖出红框）",
                                      foreground=C_OK if n else C_WARN)
@@ -381,6 +407,22 @@ class App:
             en(self.btn_clearbox, ready and n > 0)
         elif self.f_box.winfo_ismapped():
             self.f_box.pack_forget()
+        if stage == "panels" and d is not None and d.layout is not None:
+            if not self.f_panel.winfo_ismapped():
+                self.f_panel.pack(fill="x", after=self.btn_panel_mode)
+            n = len(d.layout["dividers"]) + 1
+            dels = sorted(i + 1 for i in d.delete)
+            if not dels:
+                txt, col = f"共 {n} 格，还没选要删哪一格（点图上的格子）", C_WARN
+            elif len(dels) >= n:
+                txt, col = "不能把所有格都删掉", C_WARN
+            else:
+                txt, col = f"共 {n} 格，将删除第 {'、'.join(map(str, dels))} 格", C_OK
+            self.lbl_panelcount.config(text=txt, foreground=col)
+            en(self.btn_panel_run, ready and 0 < len(dels) < n)
+            en(self.cmb_panels, ready)
+        elif self.f_panel.winfo_ismapped():
+            self.f_panel.pack_forget()
         done = ready and stage == "done"
         en(self.chk_brush, done)
         en(self.scale_brush, done)
@@ -389,7 +431,7 @@ class App:
         en(self.btn_clearbrush, done and has_brush)
         en(self.btn_undo, done and (bool(d.history) or has_brush))
         en(self.btn_save, done)
-        en(self.btn_restart, ready and stage in ("boxing", "done"))
+        en(self.btn_restart, ready and stage in ("boxing", "panels", "done"))
         en(self.btn_openfolder, d is not None and d.saved_path is not None)
         en(self.btn_add, not self.busy)
         en(self.btn_remove, not self.busy and d is not None)
@@ -544,6 +586,7 @@ class App:
             return
         msgs = {"loaded": "请在右边选择处理方式。",
                 "boxing": "在图上拖出红框框住要去掉的头，然后点「✓ 开始去头」。",
+                "panels": "点图上要删掉的那一格（变红），然后点「✓ 删除选中的格」。",
                 "done": "检查一下效果，有残留可以用笔刷修补，满意就点「保存…」。"}
         if d.saved_path:
             self.set_status(f"{d.name}\n✓ 已保存到：{d.saved_path}\n\n可以点「打开保存位置」查看；继续修补后可以再次保存；或者在上面列表里选下一张。")
@@ -678,6 +721,96 @@ class App:
             self.describe()
         self.run(f"正在去头（{n} 个）…", job, after)
 
+    # ---------------------------------------------------------------- delete a panel
+    def enter_panels(self):
+        d = self.doc
+        if d is None or d.orig is None or self.busy:
+            return
+        if self.ratio_value() is None:
+            self.show_toast("✗ 比例格式不对，请写成 21:9 这样", "warn")
+            return
+        d.mode, d.stage = "panel", "panels"
+        d.result, d.history, d.brush, d.saved_path = None, [], None, None
+        d.cache = {}
+        self.brush_on.set(False)
+        if d.layout is None:
+            self.panel_n.set("自动识别")
+            self.redetect_panels(first=True)
+        else:
+            self.fit()
+            self.show_toast("点一下要删掉的那一格（变红 = 删除）", "info", 3500)
+            self.describe()
+        self.update_controls()
+
+    def redetect_panels(self, first=False):
+        d = self.doc
+        if d is None or d.orig is None or self.busy:
+            return
+        choice = self.panel_n.get()
+        n = None if choice == "自动识别" else int(choice)
+
+        def job(say):
+            return core.detect_panels(d.orig, n)
+
+        def after(lay):
+            d.layout = lay
+            k = len(lay["dividers"]) + 1
+            d.delete = {1} if k == 3 else set()      # three views: drop the middle one by default
+            if d.stage != "panels":
+                d.stage = "panels"
+            self.fit()
+            if n is None and not lay["confident"]:
+                self.show_toast("没认出明显的分格，先按 3 格等分，请拖动青色竖线调整", "warn", 4500)
+            elif k == 3:
+                self.show_toast("✓ 识别出 3 格，已选中中间那格（红色 = 会被删掉）", "ok", 3800)
+            else:
+                self.show_toast(f"✓ 分成 {k} 格，请点要删掉的那一格", "ok", 3500)
+            self.describe()
+        self.run("正在识别分格…", job, after)
+
+    def run_panels(self):
+        d = self.doc
+        if d is None or d.layout is None or self.busy:
+            return
+        n = len(d.layout["dividers"]) + 1
+        dels = set(d.delete)
+        if not dels or len(dels) >= n:
+            return
+        layout = {**d.layout, "dividers": [list(x) for x in d.layout["dividers"]]}
+        spec = self.spec()
+
+        def job(say):
+            d.result = core.remove_panels(d.orig, layout, dels)
+            d.cache = {}
+            say("正在生成预览…")
+            return self.output(d, spec=spec)
+
+        def after(out):
+            d.stage = "done"
+            self.fit()
+            names = "、".join(str(i + 1) for i in sorted(dels))
+            self.show_toast(f"✓ 已删掉第 {names} 格，并转成 {self.ratio.get()}")
+            self.describe()
+        self.run("正在删除选中的格…", job, after)
+
+    def _panel_at(self, sx):
+        """Index of the panel under screen x, or None."""
+        d = self.doc
+        dx, _ = self.to_disp(sx, 0)
+        for i, (p0, p1) in enumerate(core.panel_ranges(d.layout)):
+            if p0 <= dx < p1:
+                return i
+        return None
+
+    def _divider_at(self, sx):
+        d = self.doc
+        for k, (a, b) in enumerate(d.layout["dividers"]):
+            sa, _ = self.to_scr(a, 0)
+            sb, _ = self.to_scr(b, 0)
+            if sa - self.HANDLE <= sx <= sb + self.HANDLE:
+                return k
+        return None
+
     # ================================================================ output
     def spec(self):
         """Output settings read on the UI thread (worker threads must not touch Tk variables)."""
@@ -728,7 +861,8 @@ class App:
             return
         from tkinter import filedialog
         stem = os.path.splitext(d.name)[0]
-        default = f"{stem}_{ratio_tag(self.ratio.get())}{'_去头' if d.mode == 'dehead' else ''}.png"
+        suffix = {"dehead": "_去头", "panel": "_删格"}.get(d.mode, "")
+        default = f"{stem}_{ratio_tag(self.ratio.get())}{suffix}.png"
         init_dir = self.settings.get("last_dir") or os.path.dirname(d.path)
         path = filedialog.asksaveasfilename(title="保存到…", initialdir=init_dir, initialfile=default,
                                             defaultextension=".png", filetypes=[("PNG 图片（无损）", "*.png")])
@@ -783,9 +917,9 @@ class App:
         if d is None or d.brush is None or d.brush.getbbox() is None or self.busy:
             return
         out_arr, (left, top), _ = self.output(d)
-        H, W = d.orig.shape[:2]
-        mask = (np.asarray(d.brush) > 0)[top:top + H, left:left + W]
         base = d.result if d.result is not None else d.orig
+        H, W = base.shape[:2]          # after deleting a panel this is narrower than the original
+        mask = (np.asarray(d.brush) > 0)[top:top + H, left:left + W]
 
         def job(say):
             return core.repair(base, mask, progress=say)
@@ -883,6 +1017,15 @@ class App:
                 m = d.brush.resize((dw, dh), Image.NEAREST, box=box)
                 red = Image.new("RGB", (dw, dh), (255, 40, 40))
                 view = Image.composite(Image.blend(view, red, 0.55), view, m)
+            if d.stage == "panels" and d.layout is not None and d.delete:
+                # tint the panels that will be dropped
+                m = Image.new("L", (dw, dh), 0)
+                md = ImageDraw.Draw(m)
+                for i, (p0, p1) in enumerate(core.panel_ranges(d.layout)):
+                    if i in d.delete:
+                        md.rectangle([(p0 - ix0) * self.scale, 0, (p1 - ix0) * self.scale - 1, dh], fill=255)
+                red = Image.new("RGB", (dw, dh), (230, 30, 30))
+                view = Image.composite(Image.blend(view, red, 0.45), view, m)
             self.tkimg = ImageTk.PhotoImage(view)
             c.create_image(sx0, sy0, anchor="nw", image=self.tkimg)
         else:
@@ -896,17 +1039,49 @@ class App:
             label = f"输出 {self.ratio.get()} · {W}×{H}" + ("（原图）" if self.show_orig else "")
             c.create_text(a, b - 8, anchor="sw", text=label, fill="#ffffff", font=(FONT, 11, "bold"))
             if offx or offy:
-                oh, ow = d.orig.shape[:2]
+                src = d.orig if (self.show_orig or d.result is None) else d.result
+                oh, ow = src.shape[:2]
                 p, q = self.to_scr(offx, offy)
                 r_, s_ = self.to_scr(offx + ow, offy + oh)
                 c.create_rectangle(p, q, r_, s_, outline="#ffd166", dash=(2, 4))
         if d.stage == "boxing":
             for k, bx in enumerate(d.boxes):
                 self._draw_box(k, bx)
+        if d.stage == "panels" and d.layout is not None:
+            self._draw_panels(H)
         if self.show_orig:
             c.create_text(12, ch - 12, anchor="sw", text="正在看原图（松开空格返回）", fill="#ffd166",
                           font=(FONT, 13, "bold"))
         self._draw_toast()
+
+    def _draw_panels(self, H):
+        c = self.canvas
+        d = self.doc
+        _, top = self.to_scr(0, 0)
+        _, bottom = self.to_scr(0, H)
+        mid = (top + bottom) / 2
+        for i, (p0, p1) in enumerate(core.panel_ranges(d.layout)):
+            a, _ = self.to_scr(p0, 0)
+            b, _ = self.to_scr(p1, 0)
+            cx = (a + b) / 2
+            gone = i in d.delete
+            t = c.create_text(cx, top + 22, text=f"第 {i + 1} 格" + ("（删除）" if gone else "（保留）"),
+                              fill="white", font=(FONT, 12, "bold"))
+            x0, y0, x1, y1 = c.bbox(t)
+            r = c.create_rectangle(x0 - 10, y0 - 4, x1 + 10, y1 + 4, fill="#d93025" if gone else C_OK, outline="")
+            c.tag_lower(r, t)
+            if gone:
+                c.create_text(cx, mid, text="✕ 删除", fill="white", font=(FONT, 30, "bold"))
+        for a, b in d.layout["dividers"]:
+            sa, _ = self.to_scr(a, 0)
+            sb, _ = self.to_scr(b, 0)
+            if sb - sa >= 2:
+                c.create_rectangle(sa, top, sb, bottom, outline="#00e5ff", width=2)
+            else:
+                c.create_line(sa, top, sa, bottom, fill="#00e5ff", width=3)
+            gx = (sa + sb) / 2
+            c.create_rectangle(gx - 9, mid + 50, gx + 9, mid + 110, fill="#00e5ff", outline="")
+            c.create_text(gx, mid + 80, text="⇔", fill="#003b44", font=(FONT, 10, "bold"), angle=90)
 
     def _draw_dropzone(self, cw, ch, loading=False):
         c = self.canvas
@@ -1010,6 +1185,13 @@ class App:
                 c.config(cursor="hand2")
             else:
                 c.config(cursor="sb_v_double_arrow" if hit[1] in ("top", "bottom") else "sb_h_double_arrow")
+        elif d.stage == "panels" and d.layout is not None:
+            if self._divider_at(e.x) is not None:
+                c.config(cursor="sb_h_double_arrow")
+            elif self._panel_at(e.x) is not None:
+                c.config(cursor="hand2")
+            else:
+                c.config(cursor="arrow")
         else:
             c.config(cursor="arrow")
 
@@ -1027,6 +1209,23 @@ class App:
                 d.brush = Image.new("L", pil.size, 0)
             self.drag = ("brush", self.to_disp(e.x, e.y))
             self._paint(e)
+            return
+        if d.stage == "panels" and d.layout is not None:
+            k = self._divider_at(e.x)
+            if k is not None:
+                a, b = d.layout["dividers"][k]
+                self.drag = ("divider", k, self.to_disp(e.x, 0)[0], a, b)
+                return
+            i = self._panel_at(e.x)
+            if i is not None:
+                if i in d.delete:
+                    d.delete.discard(i)
+                    self.show_toast(f"已取消：第 {i + 1} 格会保留", "info")
+                else:
+                    d.delete.add(i)
+                    self.show_toast(f"✓ 已选中第 {i + 1} 格（会被删掉）")
+                self.render()
+                self.update_controls()
             return
         if d.stage != "boxing":
             if d.stage == "loaded":
@@ -1082,6 +1281,16 @@ class App:
             else:
                 b[3] = int(max(min(H, dy), b[1] + 4))
             self.render()
+        elif kind == "divider":
+            _, k, start, a0, b0 = self.drag
+            divs = d.layout["dividers"]
+            width = b0 - a0
+            lo = (divs[k - 1][1] if k > 0 else d.layout["L"]) + 10          # keep every panel ≥ 10 px
+            hi = (divs[k + 1][0] if k + 1 < len(divs) else d.layout["R"]) - 10 - width
+            a = int(round(a0 + self.to_disp(e.x, 0)[0] - start))
+            a = max(lo, min(hi, a))
+            divs[k] = [a, a + width]
+            self.render()
 
     def on_release(self, e):
         if not self.drag:
@@ -1109,6 +1318,9 @@ class App:
             k, side = self.drag[1]
             self._flash(k)
             self.show_toast(f"✓ 已调整第 {k + 1} 个框" + ("的切口" if side == "bottom" else ""))
+        elif kind == "divider":
+            k = self.drag[1]
+            self.show_toast(f"✓ 已移动第 {k + 1} 条分界线")
         self.drag = None
         self.update_controls()
 
